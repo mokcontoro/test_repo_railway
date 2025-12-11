@@ -491,6 +491,10 @@ routes = [
     Route("/oauth/login", login, methods=["POST"]),
     Route("/oauth/token", token, methods=["POST"]),
     Route("/oauth/revoke", revoke, methods=["POST"]),
+    # MCP endpoints at root level for Claude.ai compatibility
+    Route("/sse", mcp_sse),
+    Route("/message", mcp_message, methods=["POST"]),
+    # Also keep /mcp/* paths for compatibility
     Route("/mcp/sse", mcp_sse),
     Route("/mcp/message", mcp_message, methods=["POST"]),
 ]

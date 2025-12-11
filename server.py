@@ -7,6 +7,8 @@ import os
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.supabase import SupabaseProvider
+from starlette.routing import Route
+from starlette.responses import JSONResponse
 
 load_dotenv()
 
@@ -27,6 +29,12 @@ auth = SupabaseProvider(
 
 # Create MCP server with Supabase authentication
 mcp = FastMCP("Claude MCP Server", auth=auth)
+
+
+# Health check endpoint for Railway
+@mcp.custom_route("/health", methods=["GET"])
+async def health(request):
+    return JSONResponse({"status": "healthy", "service": "mcp-server"})
 
 
 @mcp.tool()

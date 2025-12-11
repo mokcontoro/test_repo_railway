@@ -1,19 +1,22 @@
 """
 MCP Server with Supabase Authentication using FastMCP
 For use with Claude.ai client
+
+Implements the /oauth/consent endpoint required by Supabase OAuth Server
 """
 
 import os
+import httpx
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.supabase import SupabaseProvider
-from starlette.routing import Route
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, HTMLResponse, RedirectResponse
 
 load_dotenv()
 
 # Configuration
 SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
 PORT = int(os.getenv("PORT", "8000"))
 HOST = os.getenv("HOST", "0.0.0.0")
 
@@ -35,6 +38,193 @@ mcp = FastMCP("Claude MCP Server", auth=auth)
 @mcp.custom_route("/health", methods=["GET"])
 async def health(request):
     return JSONResponse({"status": "healthy", "service": "mcp-server"})
+
+
+# OAuth consent endpoint required by Supabase OAuth Server
+@mcp.custom_route("/oauth/consent", methods=["GET", "POST"])
+async def oauth_consent(request):
+    """
+    OAuth consent endpoint for Supabase OAuth Server.
+    Supabase redirects here with authorization_id, we show consent screen,
+    then approve/deny and redirect back.
+    """
+    authorization_id = request.query_params.get("authorization_id")
+
+    if not authorization_id:
+        return HTMLResponse(
+            "<h1>Error</h1><p>Missing authorization_id</p>",
+            status_code=400
+        )
+
+    # For POST requests (form submission), handle approval/denial
+    if request.method == "POST":
+        form = await request.form()
+        action = form.get("action")
+        auth_id = form.get("authorization_id")
+
+        if action == "approve":
+            # Call Supabase to approve the authorization
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{SUPABASE_URL}/auth/v1/oauth/authorize",
+                    headers={
+                        "apikey": SUPABASE_ANON_KEY,
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "authorization_id": auth_id,
+                        "consent": "approve"
+                    }
+                )
+
+                if response.status_code == 200:
+                    data = response.json()
+                    redirect_to = data.get("redirect_to")
+                    if redirect_to:
+                        return RedirectResponse(redirect_to, status_code=302)
+
+                # If something went wrong, show error
+                return HTMLResponse(
+                    f"<h1>Error</h1><p>Failed to approve: {response.text}</p>",
+                    status_code=500
+                )
+
+        elif action == "deny":
+            # Call Supabase to deny the authorization
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{SUPABASE_URL}/auth/v1/oauth/authorize",
+                    headers={
+                        "apikey": SUPABASE_ANON_KEY,
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "authorization_id": auth_id,
+                        "consent": "deny"
+                    }
+                )
+
+                if response.status_code == 200:
+                    data = response.json()
+                    redirect_to = data.get("redirect_to")
+                    if redirect_to:
+                        return RedirectResponse(redirect_to, status_code=302)
+
+                return HTMLResponse(
+                    "<h1>Access Denied</h1><p>You denied the authorization request.</p>"
+                )
+
+    # GET request - show consent form
+    # First, fetch authorization details from Supabase
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            f"{SUPABASE_URL}/auth/v1/oauth/authorize",
+            headers={
+                "apikey": SUPABASE_ANON_KEY,
+            },
+            params={"authorization_id": authorization_id}
+        )
+
+        if response.status_code != 200:
+            return HTMLResponse(
+                f"<h1>Error</h1><p>Failed to fetch authorization details: {response.text}</p>",
+                status_code=400
+            )
+
+        auth_details = response.json()
+
+    client_name = auth_details.get("client", {}).get("name", "Unknown Application")
+    scopes = auth_details.get("scopes", [])
+
+    # Show consent page
+    consent_html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Authorize Access - MCP Server</title>
+        <style>
+            body {{
+                font-family: system-ui, -apple-system, sans-serif;
+                max-width: 500px;
+                margin: 80px auto;
+                padding: 20px;
+                background: #f5f5f5;
+            }}
+            .card {{
+                background: white;
+                border-radius: 12px;
+                padding: 32px;
+                box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            }}
+            h1 {{
+                margin-top: 0;
+                color: #333;
+            }}
+            .app-name {{
+                font-weight: 600;
+                color: #5046e5;
+            }}
+            .scopes {{
+                background: #f8f8f8;
+                border-radius: 8px;
+                padding: 16px;
+                margin: 16px 0;
+            }}
+            .scopes li {{
+                margin: 8px 0;
+            }}
+            .buttons {{
+                display: flex;
+                gap: 12px;
+                margin-top: 24px;
+            }}
+            button {{
+                flex: 1;
+                padding: 12px 24px;
+                border: none;
+                border-radius: 8px;
+                font-size: 16px;
+                cursor: pointer;
+                transition: opacity 0.2s;
+            }}
+            button:hover {{
+                opacity: 0.9;
+            }}
+            .approve {{
+                background: #5046e5;
+                color: white;
+            }}
+            .deny {{
+                background: #e5e5e5;
+                color: #333;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <h1>Authorize Access</h1>
+            <p><span class="app-name">{client_name}</span> wants to access your MCP Server.</p>
+
+            <div class="scopes">
+                <strong>This application will be able to:</strong>
+                <ul>
+                    {"".join(f"<li>{scope}</li>" for scope in scopes) if scopes else "<li>Access MCP tools and resources</li>"}
+                </ul>
+            </div>
+
+            <form method="POST">
+                <input type="hidden" name="authorization_id" value="{authorization_id}">
+                <div class="buttons">
+                    <button type="submit" name="action" value="deny" class="deny">Deny</button>
+                    <button type="submit" name="action" value="approve" class="approve">Approve</button>
+                </div>
+            </form>
+        </div>
+    </body>
+    </html>
+    """
+
+    return HTMLResponse(consent_html)
 
 
 @mcp.tool()

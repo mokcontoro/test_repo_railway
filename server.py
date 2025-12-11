@@ -24,6 +24,9 @@ from supabase import create_client, Client
 import jwt
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.sse import SseServerTransport
+from sse_starlette.sse import EventSourceResponse
+import anyio
 
 load_dotenv()
 
@@ -447,6 +450,9 @@ def validate_token(token: str) -> Optional[dict]:
 # MCP Server Setup
 mcp = FastMCP("Claude MCP Server")
 
+# SSE Transport for MCP
+sse_transport = SseServerTransport("/message")
+
 
 @mcp.tool()
 def hello(name: str) -> str:
@@ -505,14 +511,19 @@ async def mcp_sse(request: Request):
     if not auth_header.startswith("Bearer "):
         return unauthorized_response("Missing or invalid Authorization header")
 
-    token = auth_header[7:]  # Remove "Bearer " prefix
-    token_data = validate_token(token)
+    token_value = auth_header[7:]  # Remove "Bearer " prefix
+    token_data = validate_token(token_value)
 
     if not token_data:
         return unauthorized_response("Invalid or expired token")
 
-    # Forward to MCP SSE handler
-    return await mcp.handle_sse(request)
+    # Connect SSE transport and run MCP server
+    async with sse_transport.connect_sse(
+        request.scope, request.receive, request._send
+    ) as streams:
+        await mcp._mcp_server.run(
+            streams[0], streams[1], mcp._mcp_server.create_initialization_options()
+        )
 
 
 async def mcp_message(request: Request):
@@ -522,13 +533,14 @@ async def mcp_message(request: Request):
     if not auth_header.startswith("Bearer "):
         return unauthorized_response("Missing or invalid Authorization header")
 
-    token = auth_header[7:]
-    token_data = validate_token(token)
+    token_value = auth_header[7:]
+    token_data = validate_token(token_value)
 
     if not token_data:
         return unauthorized_response("Invalid or expired token")
 
-    return await mcp.handle_message(request)
+    # Handle POST message
+    await sse_transport.handle_post_message(request.scope, request.receive, request._send)
 
 
 async def health(request: Request) -> JSONResponse:

@@ -48,6 +48,7 @@ authorization_codes: dict = {}
 access_tokens: dict = {}
 refresh_tokens: dict = {}
 pkce_challenges: dict = {}
+registered_clients: dict = {}  # For dynamic client registration
 
 
 # OAuth 2.1 Helper Functions
@@ -73,6 +74,17 @@ def verify_pkce(code_verifier: str, code_challenge: str, method: str = "S256") -
 
 
 # OAuth 2.1 Endpoints
+
+async def oauth_protected_resource_metadata(request: Request) -> JSONResponse:
+    """Protected Resource Metadata (RFC 9728) - Required for Claude.ai"""
+    return JSONResponse({
+        "resource": BASE_URL,
+        "authorization_servers": [BASE_URL],
+        "scopes_supported": ["mcp:read", "mcp:write", "mcp:admin"],
+        "bearer_methods_supported": ["header"],
+    })
+
+
 async def oauth_metadata(request: Request) -> JSONResponse:
     """OAuth 2.1 Authorization Server Metadata (RFC 8414)"""
     return JSONResponse({
@@ -80,12 +92,53 @@ async def oauth_metadata(request: Request) -> JSONResponse:
         "authorization_endpoint": f"{BASE_URL}/oauth/authorize",
         "token_endpoint": f"{BASE_URL}/oauth/token",
         "token_endpoint_auth_methods_supported": ["client_secret_post", "none"],
+        "registration_endpoint": f"{BASE_URL}/oauth/register",  # Dynamic Client Registration
         "revocation_endpoint": f"{BASE_URL}/oauth/revoke",
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],  # OAuth 2.1 requires S256
         "scopes_supported": ["mcp:read", "mcp:write", "mcp:admin"],
     })
+
+
+async def register_client(request: Request) -> JSONResponse:
+    """Dynamic Client Registration (RFC 7591) - Required for Claude.ai"""
+    try:
+        body = await request.json()
+    except:
+        return JSONResponse(
+            {"error": "invalid_request", "error_description": "Invalid JSON body"},
+            status_code=400
+        )
+
+    # Generate client credentials
+    client_id = f"client_{secrets.token_urlsafe(16)}"
+    client_secret = secrets.token_urlsafe(32)
+    issued_at = int(time.time())
+
+    # Store client registration
+    registered_clients[client_id] = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "client_name": body.get("client_name", "Unknown Client"),
+        "redirect_uris": body.get("redirect_uris", []),
+        "grant_types": body.get("grant_types", ["authorization_code"]),
+        "response_types": body.get("response_types", ["code"]),
+        "token_endpoint_auth_method": body.get("token_endpoint_auth_method", "client_secret_post"),
+        "issued_at": issued_at,
+    }
+
+    return JSONResponse({
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "client_id_issued_at": issued_at,
+        "client_secret_expires_at": 0,  # Never expires
+        "client_name": body.get("client_name", "Unknown Client"),
+        "redirect_uris": body.get("redirect_uris", []),
+        "grant_types": body.get("grant_types", ["authorization_code"]),
+        "response_types": body.get("response_types", ["code"]),
+        "token_endpoint_auth_method": body.get("token_endpoint_auth_method", "client_secret_post"),
+    }, status_code=201)
 
 
 async def authorize(request: Request) -> HTMLResponse | RedirectResponse:
@@ -432,25 +485,31 @@ def get_server_info() -> str:
     })
 
 
+# Helper for 401 responses with proper WWW-Authenticate header (RFC 9728)
+def unauthorized_response(error_description: str) -> JSONResponse:
+    """Return 401 with WWW-Authenticate header pointing to resource metadata"""
+    return JSONResponse(
+        {"error": "unauthorized", "error_description": error_description},
+        status_code=401,
+        headers={
+            "WWW-Authenticate": f'Bearer resource_metadata="{BASE_URL}/.well-known/oauth-protected-resource"'
+        }
+    )
+
+
 # HTTP Endpoints for MCP-over-HTTP with auth
 async def mcp_sse(request: Request):
     """MCP SSE endpoint with OAuth authentication"""
     auth_header = request.headers.get("Authorization", "")
 
     if not auth_header.startswith("Bearer "):
-        return JSONResponse(
-            {"error": "unauthorized", "error_description": "Missing or invalid Authorization header"},
-            status_code=401
-        )
+        return unauthorized_response("Missing or invalid Authorization header")
 
     token = auth_header[7:]  # Remove "Bearer " prefix
     token_data = validate_token(token)
 
     if not token_data:
-        return JSONResponse(
-            {"error": "unauthorized", "error_description": "Invalid or expired token"},
-            status_code=401
-        )
+        return unauthorized_response("Invalid or expired token")
 
     # Forward to MCP SSE handler
     return await mcp.handle_sse(request)
@@ -461,19 +520,13 @@ async def mcp_message(request: Request):
     auth_header = request.headers.get("Authorization", "")
 
     if not auth_header.startswith("Bearer "):
-        return JSONResponse(
-            {"error": "unauthorized", "error_description": "Missing or invalid Authorization header"},
-            status_code=401
-        )
+        return unauthorized_response("Missing or invalid Authorization header")
 
     token = auth_header[7:]
     token_data = validate_token(token)
 
     if not token_data:
-        return JSONResponse(
-            {"error": "unauthorized", "error_description": "Invalid or expired token"},
-            status_code=401
-        )
+        return unauthorized_response("Invalid or expired token")
 
     return await mcp.handle_message(request)
 
@@ -486,10 +539,14 @@ async def health(request: Request) -> JSONResponse:
 # Application Setup
 routes = [
     Route("/health", health),
+    # OAuth discovery endpoints (RFC 8414, RFC 9728)
     Route("/.well-known/oauth-authorization-server", oauth_metadata),
+    Route("/.well-known/oauth-protected-resource", oauth_protected_resource_metadata),
+    # OAuth endpoints
     Route("/oauth/authorize", authorize),
     Route("/oauth/login", login, methods=["POST"]),
     Route("/oauth/token", token, methods=["POST"]),
+    Route("/oauth/register", register_client, methods=["POST"]),  # Dynamic Client Registration
     Route("/oauth/revoke", revoke, methods=["POST"]),
     # MCP endpoints at root level for Claude.ai compatibility
     Route("/sse", mcp_sse),
